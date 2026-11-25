@@ -1,0 +1,36 @@
+{
+  "name": "manifestation-board",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node --env-file=.env --import tsx --watch backend/src/server.ts",
+    "dev:api": "node --env-file=.env --import tsx --watch backend/src/server.ts",
+    "build": "tsc -p backend/tsconfig.json",
+    "start": "node --env-file=.env build/backend/server.js",
+    "build:api": "tsc -p backend/tsconfig.json",
+    "start:api": "node --env-file=.env build/backend/server.js",
+    "db:migrate": "node --env-file=.env --import tsx backend/src/db/migrate.ts",
+    "db:hash-interaction-devices": "node --env-file=.env --import tsx backend/src/db/hash-interaction-devices.ts",
+    "admin:bootstrap": "node --env-file=.env --import tsx backend/src/admin/bootstrap.ts",
+    "test:api": "node --import tsx --test backend/src/config.test.ts backend/src/app.test.ts backend/src/http.test.ts backend/src/request-context.test.ts backend/src/identifiers.test.ts backend/src/db/permissions.test.ts backend/src/db/migration-lock.test.ts backend/src/db/migration-security.test.ts backend/src/db/device-backfill.test.ts backend/src/admin/controller.test.ts backend/src/admin/service.test.ts backend/src/admin/bootstrap.test.ts backend/src/admin/cleanup.test.ts backend/src/names/service.test.ts backend/src/filter/service.test.ts backend/src/posts/controller.test.ts backend/src/posts/captcha.test.ts backend/src/posts/service.test.ts backend/src/posts/feed.test.ts"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^20",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5"
+  }
+}
