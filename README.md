@@ -2,6 +2,8 @@
 
 Anonymous semester-goal board backend built with Node.js, TypeScript, Express, and PostgreSQL.
 
+**Frontend/API reference:** [API Specification](API-SPEC.md) contains every route, request and response shape, required header, enum, error, and integration note.
+
 ## Requirements
 
 - Node.js 20.6 or newer
