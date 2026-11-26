@@ -1,6 +1,6 @@
 import { randomInt } from "node:crypto";
-import { httpError } from "../errors.js";
-import { sanitizeText } from "../text.js";
+import type { Pool } from "pg";
+import { ApiError } from "../errors.js";
 
 const firstWords = [
   "Manifest",
@@ -30,21 +30,18 @@ const secondWords = [
 
 const randomNameAttempts = 32;
 
-export type NameKeyLookup = (nameKeys: string[]) => Promise<string[]>;
-
-export function sanitizeName(value: string): string {
-  return sanitizeText(value);
-}
-
 export function normalizeName(value: string): string {
-  return sanitizeName(value).toLowerCase();
+  return value.normalize("NFKC").trim().toLowerCase();
 }
 
-export function createNamesService(findNameKeys: NameKeyLookup) {
+export function createNamesService(pool: Pool) {
   async function isAvailable(name: string): Promise<boolean> {
-    const key = normalizeName(name);
-    const existing = await findNameKeys([key]);
-    return !existing.includes(key);
+    const nameKey = normalizeName(name);
+    const result = await pool.query<{ available: boolean }>(
+      "SELECT NOT EXISTS (SELECT 1 FROM posts WHERE name_key = $1) AS available",
+      [nameKey],
+    );
+    return result.rows[0]?.available ?? false;
   }
 
   async function randomName(): Promise<string> {
@@ -54,18 +51,18 @@ export function createNamesService(findNameKeys: NameKeyLookup) {
       const number = randomInt(1000).toString().padStart(3, "0");
       return `${first}-${second}-${number}`;
     });
-    const keys = candidates.map(normalizeName);
-    const existing = new Set(await findNameKeys([...new Set(keys)]));
-    const availableIndex = keys.findIndex((key) => !existing.has(key));
-
-    if (availableIndex === -1) {
-      throw httpError(503, "No names are currently available");
+    const keys = [...new Set(candidates.map(normalizeName))];
+    const existing = await pool.query<{ name_key: string }>(
+      "SELECT name_key FROM posts WHERE name_key = ANY($1::text[])",
+      [keys],
+    );
+    const taken = new Set(existing.rows.map((row) => row.name_key));
+    const available = candidates.find((candidate) => !taken.has(normalizeName(candidate)));
+    if (!available) {
+      throw new ApiError(503, "No names are currently available");
     }
-
-    return candidates[availableIndex];
+    return available;
   }
 
   return { isAvailable, randomName };
 }
-
-export type NamesService = ReturnType<typeof createNamesService>;

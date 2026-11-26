@@ -1,80 +1,82 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Pool } from "pg";
-import { loadMigrationDatabaseConfig } from "../config.js";
-import { withMigrationLock } from "./migration-lock.js";
+import { Pool, type PoolClient } from "pg";
 
-function safeErrorCode(error: unknown): string | null {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    typeof error.code === "string" &&
-    /^[A-Z0-9_]{1,16}$/.test(error.code)
-  ) {
-    return error.code;
-  }
-  return null;
-}
+const migrationLockId = 51467101;
+const migrationFilePattern = /^\d+_[\w-]+\.sql$/;
 
 async function runMigrations(): Promise<void> {
-  const config = loadMigrationDatabaseConfig();
-  const pool = new Pool({
-    connectionString: config.databaseUrl,
-    max: 1,
-    connectionTimeoutMillis: 10_000,
-    statement_timeout: 120_000,
-    query_timeout: 130_000,
-  });
-  const migrationDir = join(process.cwd(), "backend", "migrations");
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is required");
+  }
+
+  const pool = new Pool({ connectionString, max: 1 });
+  const migrationDirectory = join(process.cwd(), "backend", "migrations");
+  let migrationClient: PoolClient | undefined;
+  let lockAcquired = false;
 
   try {
-    const files = (await readdir(migrationDir))
-      .filter((file) => /^\d+_[\w-]+\.sql$/.test(file))
-      .sort();
     const client = await pool.connect();
-    try {
-      await withMigrationLock(client, async () => {
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS schema_migrations (
-            name text PRIMARY KEY,
-            applied_at timestamptz NOT NULL DEFAULT now()
-          )
-        `);
+    migrationClient = client;
+    await client.query("SELECT pg_advisory_lock($1)", [migrationLockId]);
+    lockAcquired = true;
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        name text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
 
-        for (const file of files) {
-          await client.query("BEGIN");
-          try {
-            const applied = await client.query(
-              "SELECT 1 FROM schema_migrations WHERE name = $1",
-              [file],
-            );
-            if (applied.rowCount) {
-              await client.query("COMMIT");
-              continue;
-            }
+    const files = (await readdir(migrationDirectory))
+      .filter((file) => migrationFilePattern.test(file))
+      .sort();
 
-            const sql = await readFile(join(migrationDir, file), "utf8");
-            await client.query(sql);
-            await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
-            await client.query("COMMIT");
-            console.log(`Applied migration ${file}`);
-          } catch (error) {
-            await client.query("ROLLBACK");
-            throw error;
-          }
+    for (const file of files) {
+      await client.query("BEGIN");
+      try {
+        const applied = await client.query(
+          "SELECT 1 FROM schema_migrations WHERE name = $1",
+          [file],
+        );
+        if (applied.rowCount) {
+          await client.query("COMMIT");
+          continue;
         }
-      });
-    } finally {
-      client.release();
+
+        const sql = await readFile(join(migrationDirectory, file), "utf8");
+        await client.query(sql);
+        await client.query(
+          "INSERT INTO schema_migrations (name) VALUES ($1)",
+          [file],
+        );
+        await client.query("COMMIT");
+        console.log(`Applied migration ${file}`);
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      }
     }
   } finally {
-    await pool.end();
+    try {
+      if (migrationClient && lockAcquired) {
+        await migrationClient.query("SELECT pg_advisory_unlock($1)", [migrationLockId]);
+      }
+    } finally {
+      migrationClient?.release();
+      await pool.end();
+    }
   }
 }
 
 runMigrations().catch((error: unknown) => {
-  const code = safeErrorCode(error);
+  const code =
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+      ? error.code
+      : null;
   console.error(code ? `Migration failed (${code})` : "Migration failed");
   process.exitCode = 1;
 });

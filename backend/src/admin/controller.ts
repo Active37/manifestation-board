@@ -1,172 +1,106 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
-import { categorySlugSchema } from "../categories.js";
-import { httpError } from "../errors.js";
-import { normalizeForMatch } from "../filter/service.js";
-import { normalizeAdminEmail } from "./service.js";
-import { sanitizeText } from "../text.js";
-import {
-  adminRoles,
-  type AdminApi,
-  type AdminSession,
-  type BannedTerm,
-} from "./types.js";
+import { ApiError } from "../errors.js";
+import type { createAdminService } from "./service.js";
 
 const sessionCookie = "__Host-admin_session";
 const sessionDurationMs = 8 * 60 * 60 * 1000;
-
-const passwordSchema = z
-  .string()
-  .min(12)
-  .max(128)
-  .refine((password) => Buffer.byteLength(password, "utf8") <= 72);
-const loginSchema = z
-  .object({
-    email: z
-      .string()
-      .transform(normalizeAdminEmail)
-      .pipe(z.string().email().max(320)),
-    password: passwordSchema,
-  })
-  .strict();
-const moderatorSchema = z
-  .object({
-    email: z
-      .string()
-      .transform(normalizeAdminEmail)
-      .pipe(z.string().email().max(320)),
-    password: passwordSchema,
-    role: z.enum(adminRoles),
-  })
-  .strict();
+const passwordSchema = z.string().min(12).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 72);
+const loginSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: passwordSchema,
+}).strict();
+const moderatorSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: passwordSchema,
+  role: z.enum(["admin", "moderator"]),
+}).strict();
 const moderatorParamsSchema = z.object({ id: z.string().uuid() }).strict();
 const postParamsSchema = z.object({ id: z.string().uuid() }).strict();
-const semesterParamsSchema = z.object({ id: z.string().uuid() }).strict();
+const bannedTermSchema = z.object({
+  term: z.string().trim().min(1),
+  type: z.string().trim().min(1),
+}).strict();
+const bannedTermsSchema = z.object({
+  terms: z.array(bannedTermSchema).max(500),
+}).strict();
 const emptyQuerySchema = z.object({}).strict();
 const emptyBodySchema = z.object({}).strict();
-const bannedTermSchema = z
-  .object({
-    term: z
-      .string()
-      .transform(sanitizeText)
-      .pipe(
-        z
-          .string()
-          .min(1)
-          .max(100)
-          .refine((term) => normalizeForMatch(term).length > 0),
-      ),
-    type: z
-      .string()
-      .transform(sanitizeText)
-      .pipe(z.string().min(1).max(40)),
-  })
-  .strict();
-const bannedTermsSchema = z
-  .object({ terms: z.array(bannedTermSchema).max(500) })
-  .strict();
-const categoriesSchema = z
-  .object({ categories: z.array(categorySlugSchema).max(100) })
-  .strict();
-const analyticsQuerySchema = z
-  .object({ semesterId: z.string().uuid().optional() })
-  .strict();
 
-function hasDuplicateTerms(terms: BannedTerm[]): boolean {
-  const keys = new Set<string>();
-  for (const { term, type } of terms) {
-    const key = `${type.toLowerCase()}\0${normalizeForMatch(term)}`;
-    if (keys.has(key)) {
-      return true;
-    }
-    keys.add(key);
-  }
-  return false;
-}
+type AdminService = ReturnType<typeof createAdminService>;
+type AdminSession = NonNullable<Awaited<ReturnType<AdminService["getSession"]>>>;
 
-function isAllowedOrigin(origin: string | undefined, origins: string[]): boolean {
-  return origin !== undefined && origins.includes(origin);
-}
-
-function requireAllowedOrigin(origins: string[]): RequestHandler {
-  return (req, _res, next) => {
-    if (!isAllowedOrigin(req.get("Origin"), origins)) {
-      next(httpError(403, "Request origin not allowed"));
-      return;
-    }
-    next();
-  };
+function normalizedEmail(email: string): string {
+  return email.normalize("NFKC").trim().toLowerCase();
 }
 
 function readSessionCookie(cookieHeader: string | undefined): string | null {
   if (!cookieHeader) {
     return null;
   }
-  const values = cookieHeader
+  const matches = cookieHeader
     .split(";")
     .map((part) => part.trim())
     .filter((part) => part.startsWith(`${sessionCookie}=`));
-  if (values.length !== 1) {
+  if (matches.length !== 1) {
     return null;
   }
-
-  const token = values[0]?.slice(sessionCookie.length + 1);
+  const token = matches[0]?.slice(sessionCookie.length + 1);
   return token && /^[A-Za-z0-9_-]{43}$/.test(token) ? token : null;
 }
 
-function matchesCsrfHash(expectedHash: string, token: string | undefined): boolean {
-  if (
-    !token ||
-    !/^[A-Za-z0-9_-]{43}$/.test(token) ||
-    !/^[a-f0-9]{64}$/i.test(expectedHash)
-  ) {
+function matchesCsrfHash(expectedHash: string, value: string | undefined): boolean {
+  if (!value || !/^[A-Za-z0-9_-]{43}$/.test(value) || !/^[a-f0-9]{64}$/.test(expectedHash)) {
     return false;
   }
-  const expected = Buffer.from(expectedHash, "hex");
-  const actual = createHash("sha256").update(token).digest();
-  return timingSafeEqual(actual, expected);
+  return timingSafeEqual(
+    Buffer.from(expectedHash, "hex"),
+    createHash("sha256").update(value).digest(),
+  );
 }
 
-export function adminRouter(api: AdminApi, corsOrigins: string[]) {
+export function adminRouter(api: AdminService, allowedOrigins: string[]): Router {
   const router = Router();
-  const originCheck = requireAllowedOrigin(corsOrigins);
+  const requireOrigin: RequestHandler = (req, _res, next) => {
+    const origin = req.get("Origin");
+    if (!origin || !allowedOrigins.includes(origin)) {
+      next(new ApiError(403, "Request origin not allowed"));
+      return;
+    }
+    next();
+  };
 
   const requireSession: RequestHandler = async (req, res, next) => {
     const token = readSessionCookie(req.get("Cookie"));
     if (!token) {
-      throw httpError(401, "Authentication required");
+      throw new ApiError(401, "Authentication required");
     }
     const session = await api.getSession(token);
     if (!session) {
-      throw httpError(401, "Authentication required");
+      throw new ApiError(401, "Authentication required");
     }
-    res.locals.admin = session satisfies AdminSession;
+    res.locals.admin = session;
+    next();
+  };
+
+  const requireStaff: RequestHandler = (_req, res, next) => {
+    const session = res.locals.admin as AdminSession | undefined;
+    if (!session || (session.role !== "admin" && session.role !== "moderator")) {
+      next(new ApiError(403, "Staff access required"));
+      return;
+    }
     next();
   };
 
   const requireAdmin: RequestHandler = async (_req, res, next) => {
     const session = res.locals.admin as AdminSession | undefined;
     if (!session) {
-      next(httpError(401, "Authentication required"));
+      next(new ApiError(401, "Authentication required"));
       return;
     }
     if (session.role !== "admin") {
-      await api.recordAuthorizationFailure(session.id);
-      next(httpError(403, "Admin access required"));
-      return;
-    }
-    next();
-  };
-
-  const requireStaff: RequestHandler = (_req, res, next) => {
-    const session = res.locals.admin as AdminSession | undefined;
-    if (!session) {
-      next(httpError(401, "Authentication required"));
-      return;
-    }
-    if (session.role !== "admin" && session.role !== "moderator") {
-      next(httpError(403, "Staff access required"));
+      next(new ApiError(403, "Admin access required"));
       return;
     }
     next();
@@ -175,53 +109,40 @@ export function adminRouter(api: AdminApi, corsOrigins: string[]) {
   const requireCsrf: RequestHandler = (req, res, next) => {
     const session = res.locals.admin as AdminSession | undefined;
     if (!session || !matchesCsrfHash(session.csrfHash, req.get("X-CSRF-Token"))) {
-      next(httpError(403, "Invalid CSRF token"));
+      next(new ApiError(403, "Invalid CSRF token"));
       return;
     }
     next();
   };
 
-  router.post("/login", originCheck, async (req, res) => {
+  router.post("/login", requireOrigin, async (req, res) => {
     if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid login request");
+      throw new ApiError(400, "Invalid login request");
     }
     const parsed = loginSchema.safeParse(req.body);
-    if (!parsed.success || !req.ip) {
-      throw httpError(400, "Invalid login request");
+    if (!parsed.success) {
+      throw new ApiError(400, "Invalid login request");
     }
-
-    const session = await api.login(
-      parsed.data.email,
-      parsed.data.password,
-      req.ip,
-    );
-    res.cookie(sessionCookie, session.sessionToken, {
+    const tokens = await api.login(normalizedEmail(parsed.data.email), parsed.data.password);
+    res.cookie(sessionCookie, tokens.sessionToken, {
       httpOnly: true,
       secure: true,
       sameSite: "strict",
       path: "/",
       maxAge: sessionDurationMs,
     });
-    res.json({ csrfToken: session.csrfToken });
+    res.json({ csrf_token: tokens.csrfToken });
   });
 
-  router.post("/logout", originCheck, async (req, res) => {
-    if (
-      !emptyQuerySchema.safeParse(req.query).success ||
-      !emptyBodySchema.safeParse(req.body ?? {}).success
-    ) {
-      throw httpError(400, "Invalid logout request");
-    }
-
+  router.post("/logout", requireOrigin, async (req, res) => {
     const token = readSessionCookie(req.get("Cookie"));
     if (token) {
       const session = await api.getSession(token);
       if (session && !matchesCsrfHash(session.csrfHash, req.get("X-CSRF-Token"))) {
-        throw httpError(403, "Invalid CSRF token");
+        throw new ApiError(403, "Invalid CSRF token");
       }
       await api.logout(token);
     }
-
     res.clearCookie(sessionCookie, {
       httpOnly: true,
       secure: true,
@@ -231,33 +152,36 @@ export function adminRouter(api: AdminApi, corsOrigins: string[]) {
     res.status(204).end();
   });
 
-  router.get("/moderators", requireSession, requireAdmin, async (req, res) => {
+  router.get("/queue", requireSession, requireStaff, async (req, res) => {
     if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid moderator query");
+      throw new ApiError(400, "Invalid moderation query");
     }
+    res.json({ posts: await api.moderationQueue() });
+  });
+
+  router.get("/rejected", requireSession, requireStaff, async (_req, res) => {
+    res.json({ posts: await api.rejectedPosts() });
+  });
+
+  router.get("/moderators", requireSession, requireAdmin, async (_req, res) => {
     res.json({ moderators: await api.listModerators() });
   });
 
   router.post(
     "/moderators",
-    originCheck,
+    requireOrigin,
     requireSession,
     requireAdmin,
     requireCsrf,
     async (req, res) => {
-      if (!emptyQuerySchema.safeParse(req.query).success) {
-        throw httpError(400, "Invalid moderator request");
-      }
       const parsed = moderatorSchema.safeParse(req.body);
       if (!parsed.success) {
-        throw httpError(400, "Invalid moderator request");
+        throw new ApiError(400, "Invalid moderator request");
       }
-
       const moderator = await api.createModerator(
-        parsed.data.email,
+        normalizedEmail(parsed.data.email),
         parsed.data.password,
         parsed.data.role,
-        (res.locals.admin as AdminSession).id,
       );
       res.status(201).json({ moderator });
     },
@@ -265,214 +189,74 @@ export function adminRouter(api: AdminApi, corsOrigins: string[]) {
 
   router.delete(
     "/moderators/:id",
-    originCheck,
+    requireOrigin,
     requireSession,
     requireAdmin,
     requireCsrf,
     async (req, res) => {
-      const parsed = moderatorParamsSchema.safeParse(req.params);
-      if (
-        !parsed.success ||
-        !emptyQuerySchema.safeParse(req.query).success
-      ) {
-        throw httpError(400, "Invalid moderator request");
+      const params = moderatorParamsSchema.safeParse(req.params);
+      if (!params.success || !emptyQuerySchema.safeParse(req.query).success) {
+        throw new ApiError(400, "Invalid moderator request");
       }
-      await api.deleteModerator(
-        parsed.data.id,
-        (res.locals.admin as AdminSession).id,
-      );
+      await api.deactivateModerator(params.data.id);
       res.status(204).end();
     },
   );
 
-  router.get("/queue", requireSession, requireStaff, async (req, res) => {
-    if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid moderation query");
-    }
-    res.json({ posts: await api.getModerationQueue() });
-  });
-
-  router.get("/rejected", requireSession, requireStaff, async (req, res) => {
-    if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid moderation query");
-    }
-    res.json({ posts: await api.getRejectedPosts() });
-  });
-
-  router.get("/banned-terms", requireSession, requireAdmin, async (req, res) => {
-    if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid banned-terms query");
-    }
-    res.json({ terms: await api.getBannedTerms() });
+  router.get("/banned-terms", requireSession, requireAdmin, async (_req, res) => {
+    res.json({ terms: await api.listBannedTerms() });
   });
 
   router.put(
     "/banned-terms",
-    originCheck,
+    requireOrigin,
     requireSession,
     requireAdmin,
     requireCsrf,
     async (req, res) => {
-      if (!emptyQuerySchema.safeParse(req.query).success) {
-        throw httpError(400, "Invalid banned-terms request");
-      }
       const parsed = bannedTermsSchema.safeParse(req.body);
       if (!parsed.success) {
-        throw httpError(400, "Invalid banned-terms request");
+        throw new ApiError(400, "Invalid banned-terms request");
       }
-      if (hasDuplicateTerms(parsed.data.terms)) {
-        throw httpError(400, "Invalid banned-terms request");
-      }
-
-      await api.replaceBannedTerms(
-        parsed.data.terms,
-        (res.locals.admin as AdminSession).id,
+      const keys = parsed.data.terms.map(
+        ({ term, type }) => `${type.toLowerCase()}\0${term.normalize("NFKC").toLowerCase()}`,
       );
-      res.json({ terms: parsed.data.terms });
+      if (new Set(keys).size !== keys.length) {
+        throw new ApiError(400, "Duplicate banned terms");
+      }
+      const terms = parsed.data.terms.map(({ term, type }) => ({
+        term: term.normalize("NFKC"),
+        type: type.normalize("NFKC"),
+      }));
+      await api.replaceBannedTerms(terms);
+      res.json({ terms });
     },
   );
 
-  router.get("/categories", requireSession, requireAdmin, async (req, res) => {
-    if (!emptyQuerySchema.safeParse(req.query).success) {
-      throw httpError(400, "Invalid categories query");
-    }
-    res.json({ categories: await api.getCategories() });
-  });
-
-  router.get("/analytics", requireSession, requireAdmin, async (req, res) => {
-    const parsed = analyticsQuerySchema.safeParse(req.query);
-    if (!parsed.success) {
-      throw httpError(400, "Invalid analytics query");
-    }
-    res.json(await api.getAnalytics(parsed.data.semesterId ?? null));
-  });
-
-  router.post(
-    "/semesters/:id/archive",
-    originCheck,
-    requireSession,
-    requireAdmin,
-    requireCsrf,
-    async (req, res) => {
-      const params = semesterParamsSchema.safeParse(req.params);
-      const body = emptyBodySchema.safeParse(req.body ?? {});
-      if (
-        !params.success ||
-        !body.success ||
-        !emptyQuerySchema.safeParse(req.query).success
-      ) {
-        throw httpError(400, "Invalid semester archive request");
-      }
-      await api.archiveSemester(
-        params.data.id,
-        (res.locals.admin as AdminSession).id,
-      );
-      res.status(204).end();
-    },
-  );
-
-  router.put(
-    "/categories",
-    originCheck,
-    requireSession,
-    requireAdmin,
-    requireCsrf,
-    async (req, res) => {
-      if (!emptyQuerySchema.safeParse(req.query).success) {
-        throw httpError(400, "Invalid categories request");
-      }
-      const parsed = categoriesSchema.safeParse(req.body);
-      if (
-        !parsed.success ||
-        new Set(parsed.data.categories).size !== parsed.data.categories.length
-      ) {
-        throw httpError(400, "Invalid categories request");
-      }
-
-      await api.replaceCategories(
-        parsed.data.categories,
-        (res.locals.admin as AdminSession).id,
-      );
-      res.json({ categories: parsed.data.categories });
-    },
-  );
-
-  function addPostAction(
+  const moderationAction = (
     path: string,
     action: (id: string, moderatorId: string) => Promise<void>,
-  ): void {
-    router.post(
-      path,
-      originCheck,
-      requireSession,
-      requireStaff,
-      requireCsrf,
-      async (req, res) => {
-        const params = postParamsSchema.safeParse(req.params);
-        const body = emptyBodySchema.safeParse(req.body ?? {});
-        if (
-          !params.success ||
-          !body.success ||
-          !emptyQuerySchema.safeParse(req.query).success
-        ) {
-          throw httpError(400, "Invalid moderation request");
-        }
-        const session = res.locals.admin as AdminSession;
-        await action(params.data.id, session.id);
-        res.status(204).end();
-      },
-    );
-  }
-
-  addPostAction("/posts/:id/approve", api.approvePost);
-  addPostAction("/posts/:id/reject", api.rejectPost);
-  addPostAction("/posts/:id/undo", api.undoModeration);
-  addPostAction("/posts/:id/restore", api.restoreRejectedPost);
-
-  router.post(
-    "/posts/:id/feature",
-    originCheck,
+  ) => router.post(
+    path,
+    requireOrigin,
     requireSession,
-    requireAdmin,
+    requireStaff,
     requireCsrf,
     async (req, res) => {
       const params = postParamsSchema.safeParse(req.params);
-      const body = emptyBodySchema.safeParse(req.body ?? {});
-      if (
-        !params.success ||
-        !body.success ||
-        !emptyQuerySchema.safeParse(req.query).success
-      ) {
-        throw httpError(400, "Invalid feature request");
+      if (!params.success || !emptyBodySchema.safeParse(req.body ?? {}).success) {
+        throw new ApiError(400, "Invalid moderation request");
       }
-      await api.featurePost(params.data.id, (res.locals.admin as AdminSession).id);
+      const session = res.locals.admin as AdminSession;
+      await action(params.data.id, session.id);
       res.status(204).end();
     },
   );
 
-  router.delete(
-    "/posts/:id/feature",
-    originCheck,
-    requireSession,
-    requireAdmin,
-    requireCsrf,
-    async (req, res) => {
-      const params = postParamsSchema.safeParse(req.params);
-      const body = emptyBodySchema.safeParse(req.body ?? {});
-      if (
-        !params.success ||
-        !body.success ||
-        !emptyQuerySchema.safeParse(req.query).success
-      ) {
-        throw httpError(400, "Invalid feature request");
-      }
-      await api.unfeaturePost(
-        params.data.id,
-        (res.locals.admin as AdminSession).id,
-      );
-      res.status(204).end();
-    },
-  );
+  moderationAction("/posts/:id/approve", api.approvePost);
+  moderationAction("/posts/:id/reject", api.rejectPost);
+  moderationAction("/posts/:id/undo", api.undoModeration);
+  moderationAction("/posts/:id/restore", api.restoreRejectedPost);
 
   return router;
 }

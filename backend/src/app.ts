@@ -1,104 +1,68 @@
+import express, {
+  type ErrorRequestHandler,
+  type Express,
+} from "express";
 import cors from "cors";
-import express, { type Express } from "express";
 import helmet from "helmet";
-import type { AdminApi } from "./admin/types.js";
-import type { AppConfig } from "./config.js";
-import { errorMiddleware, httpError } from "./errors.js";
-import { requestIdMiddleware } from "./request-context.js";
-import type { NamesService } from "./names/service.js";
-import type { PostsApi } from "./posts/types.js";
+import type { Pool } from "pg";
 import { adminRouter } from "./admin/controller.js";
-import { healthRouter } from "./routes/health.js";
-import { namesRouter } from "./routes/names.js";
-import { postsRouter } from "./routes/posts.js";
-import { semestersRouter } from "./routes/semesters.js";
+import { createAdminService } from "./admin/service.js";
+import { loadConfig, type AppConfig } from "./config.js";
+import { ApiError } from "./errors.js";
+import { namesRouter } from "./names/controller.js";
+import { createNamesService } from "./names/service.js";
+import { postsRouter } from "./posts/controller.js";
+import { createPostsFeedService } from "./posts/feed.js";
+import { createPostsService } from "./posts/service.js";
+import { verifyTurnstile } from "./posts/captcha.js";
 
-export function createApp(
-  config: Pick<
-    AppConfig,
-    | "corsOrigins"
-    | "trustedProxies"
-    | "requestTimeoutMs"
-    | "nodeEnv"
-    | "postCaptchaBypass"
-  >,
-  checkDb: () => Promise<void>,
-  namesService: NamesService,
-  postsApi: PostsApi,
-  adminApi: AdminApi,
-): Express {
+type AppOptions = {
+  config?: AppConfig;
+  verifyCaptcha?: (token: string) => Promise<boolean>;
+};
+
+export function createApp(pool: Pool, options: AppOptions = {}): Express {
+  const config = options.config ?? loadConfig();
   const app = express();
+  const postsService = createPostsService(pool, config);
+  const postsFeedService = createPostsFeedService(pool);
+  const namesService = createNamesService(pool);
+  const adminService = createAdminService(pool);
+  const verifyCaptcha = options.verifyCaptcha ?? ((token: string) =>
+    verifyTurnstile(token, config.turnstileSecretKey));
 
   app.disable("x-powered-by");
   app.set("trust proxy", config.trustedProxies);
-  app.use(requestIdMiddleware);
-  app.use((req, res, next) => {
-    const timer = setTimeout(() => {
-      if (res.headersSent) {
-        res.destroy();
-        return;
-      }
-      res.status(504).json({ error: "Request timed out" });
-    }, config.requestTimeoutMs);
-    res.once("finish", () => clearTimeout(timer));
-    res.once("close", () => clearTimeout(timer));
-    next();
-  });
   app.use(helmet());
-  app.use((req, _res, next) => {
-    if (config.nodeEnv === "production" && !req.secure) {
-      next(httpError(426, "HTTPS required"));
-      return;
-    }
-    next();
-  });
-  app.use(
-    cors({
-      origin: (origin, callback) => {
-        callback(null, origin !== undefined && config.corsOrigins.includes(origin));
-      },
-      credentials: true,
-      exposedHeaders: ["X-Request-Id"],
-      methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-      allowedHeaders: [
-        "Content-Type",
-        "Authorization",
-        "X-Device-Id",
-        "X-Edit-Key",
-        "X-Captcha-Token",
-        "X-CSRF-Token",
-      ],
-    }),
-  );
-  app.use((req, _res, next) => {
-    const hasBody =
-      req.headers["transfer-encoding"] !== undefined ||
-      Number(req.headers["content-length"] ?? 0) > 0;
-    if (!hasBody) {
-      next();
-      return;
-    }
-
-    if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
-      next(httpError(400, "Request body is not allowed"));
-      return;
-    }
-    if (!req.is("application/json")) {
-      next(httpError(415, "Content-Type must be application/json"));
-      return;
-    }
-    next();
-  });
+  app.use(cors({
+    origin: (origin, callback) => {
+      callback(null, origin !== undefined && config.corsOrigins.includes(origin));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-Device-Id", "X-Edit-Key"],
+  }));
   app.use(express.json({ limit: "16kb" }));
-  app.use(healthRouter(checkDb));
-  app.use("/names", namesRouter(namesService, postsApi.checkNameRateLimit));
-  app.use(
-    "/posts",
-    postsRouter(postsApi, config.corsOrigins, config.postCaptchaBypass),
-  );
-  app.use("/semesters", semestersRouter(postsApi));
-  app.use("/admin", adminRouter(adminApi, config.corsOrigins));
-  app.use(errorMiddleware);
+  app.use("/names", namesRouter(namesService));
+  app.use("/posts", postsRouter(postsService, postsFeedService, { verifyCaptcha }));
+  app.use("/admin", adminRouter(adminService, config.corsOrigins));
+  app.use(((error, _req, res, _next) => {
+    if (error instanceof ApiError) {
+      res.status(error.statusCode).json({ error: error.message });
+      return;
+    }
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "type" in error &&
+      error.type === "entity.too.large"
+    ) {
+      res.status(413).json({ error: "Request body is too large" });
+      return;
+    }
+    console.error("Unhandled API error", error);
+    res.status(500).json({ error: "Internal server error" });
+  }) satisfies ErrorRequestHandler);
 
   return app;
 }
