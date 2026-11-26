@@ -1,17 +1,13 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Pool, type PoolClient } from "pg";
+import { loadMigrationDatabaseUrl } from "../config.js";
 
 const migrationLockId = 51467101;
 const migrationFilePattern = /^\d+_[\w-]+\.sql$/;
 
 async function runMigrations(): Promise<void> {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is required");
-  }
-
-  const pool = new Pool({ connectionString, max: 1 });
+  const pool = new Pool({ connectionString: loadMigrationDatabaseUrl(), max: 1 });
   const migrationDirectory = join(process.cwd(), "backend", "migrations");
   let migrationClient: PoolClient | undefined;
   let lockAcquired = false;

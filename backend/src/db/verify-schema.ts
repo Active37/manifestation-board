@@ -87,6 +87,18 @@ const expectedColumns: Record<string, ExpectedColumn[]> = {
     optional("undone_at", "timestamp with time zone"),
     optional("undone_by", "uuid"),
   ],
+  used_captcha_tokens: [
+    required("token_hash", "text"),
+    required("created_at", "timestamp with time zone"),
+  ],
+  check_ins: [
+    required("id", "uuid"),
+    required("post_id", "uuid"),
+    required("email", "text"),
+    required("consented_at", "timestamp with time zone"),
+    optional("sent_at", "timestamp with time zone"),
+    optional("unsubscribed_at", "timestamp with time zone"),
+  ],
 };
 
 const requiredConstraints = [
@@ -129,6 +141,13 @@ const requiredConstraints = [
   "moderation_actions_to_status_check",
   "moderation_actions_undo_pair_check",
   "moderation_actions_undone_by_fkey",
+  "used_captcha_tokens_pkey",
+  "used_captcha_tokens_hash_check",
+  "check_ins_pkey",
+  "check_ins_post_id_key",
+  "check_ins_post_id_fkey",
+  "check_ins_email_length_check",
+  "check_ins_email_trimmed_check",
 ];
 
 const requiredIndexes = [
@@ -141,6 +160,8 @@ const requiredIndexes = [
   "admin_sessions_expires_at_idx",
   "moderation_actions_undo_idx",
   "moderation_actions_created_at_idx",
+  "used_captcha_tokens_created_at_idx",
+  "check_ins_pending_send_idx",
 ];
 
 function sorted(values: string[]): string[] {

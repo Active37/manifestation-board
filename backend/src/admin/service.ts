@@ -34,6 +34,12 @@ export type ModerationPost = {
 };
 
 export type BannedTerm = { term: string; type: string };
+export type Semester = {
+  id: string;
+  name: string;
+  ends_on: string;
+  state: "open" | "closed";
+};
 
 type ModeratorRow = QueryResultRow & Moderator & { password_hash: string };
 type ModerationAction = "approve" | "reject" | "restore";
@@ -415,6 +421,65 @@ export function createAdminService(pool: Pool) {
     return result.rows;
   }
 
+  async function listSemesters(): Promise<Semester[]> {
+    const result = await pool.query<Semester>(
+      "SELECT id, name, ends_on::text AS ends_on, state FROM semesters ORDER BY ends_on DESC, id",
+    );
+    return result.rows;
+  }
+
+  async function createSemester(name: string, endsOn: string): Promise<Semester> {
+    try {
+      const result = await pool.query<Semester>(
+        `
+          INSERT INTO semesters (name, ends_on, state)
+          VALUES ($1, $2::date, 'open')
+          RETURNING id, name, ends_on::text AS ends_on, state
+        `,
+        [name.trim(), endsOn],
+      );
+      const semester = result.rows[0];
+      if (!semester) {
+        throw new Error("Semester insert returned no row");
+      }
+      return semester;
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "23505" &&
+        "constraint" in error &&
+        error.constraint === "semesters_one_open_idx"
+      ) {
+        throw new ApiError(409, "An open semester already exists");
+      }
+      throw error;
+    }
+  }
+
+  async function closeSemester(id: string): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await transaction(client, async () => {
+        const result = await client.query<{ state: "open" | "closed" }>(
+          "SELECT state FROM semesters WHERE id = $1 FOR UPDATE",
+          [id],
+        );
+        const semester = result.rows[0];
+        if (!semester) {
+          throw new ApiError(404, "Semester not found");
+        }
+        if (semester.state !== "open") {
+          throw new ApiError(409, "Semester is already closed");
+        }
+        await client.query("UPDATE semesters SET state = 'closed' WHERE id = $1", [id]);
+      });
+    } finally {
+      client.release();
+    }
+  }
+
   async function replaceBannedTerms(terms: BannedTerm[]): Promise<void> {
     const client = await pool.connect();
     try {
@@ -455,5 +520,8 @@ export function createAdminService(pool: Pool) {
     purgeExpiredSessions,
     listBannedTerms,
     replaceBannedTerms,
+    listSemesters,
+    createSemester,
+    closeSemester,
   };
 }

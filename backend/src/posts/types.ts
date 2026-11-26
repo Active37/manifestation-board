@@ -21,6 +21,7 @@ export type NewPostInput = {
   display_name: string;
   body: string;
   category?: PostCategory | null;
+  check_in_email?: string;
 };
 
 export type PostPatch = Partial<NewPostInput>;

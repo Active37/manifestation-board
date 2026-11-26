@@ -29,18 +29,33 @@ export function createApp(pool: Pool, options: AppOptions = {}): Express {
   const namesService = createNamesService(pool);
   const adminService = createAdminService(pool);
   const verifyCaptcha = options.verifyCaptcha ?? ((token: string) =>
-    verifyTurnstile(token, config.turnstileSecretKey));
+    verifyTurnstile(token, config.turnstileSecretKey, {
+      hostname: config.turnstileExpectedHostname,
+      action: config.turnstileExpectedAction,
+    }));
 
   app.disable("x-powered-by");
   app.set("trust proxy", config.trustedProxies);
   app.use(helmet());
+  app.use((req, _res, next) => {
+    if (config.nodeEnv === "production" && !req.secure) {
+      next(new ApiError(426, "HTTPS required"));
+      return;
+    }
+    next();
+  });
   app.use(cors({
     origin: (origin, callback) => {
       callback(null, origin !== undefined && config.corsOrigins.includes(origin));
     },
     credentials: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "X-Device-Id", "X-Edit-Key"],
+    allowedHeaders: [
+      "Content-Type",
+      "X-Device-Id",
+      "X-Edit-Key",
+      "X-CSRF-Token",
+    ],
   }));
   app.use(express.json({ limit: "16kb" }));
   app.use("/names", namesRouter(namesService));

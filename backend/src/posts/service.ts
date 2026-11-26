@@ -136,7 +136,13 @@ export function createPostsService(
     }
   }
 
-  async function createPost(input: NewPostInput): Promise<CreatedPost> {
+  async function createPost(
+    input: NewPostInput,
+    captchaTokenHash: string,
+  ): Promise<CreatedPost> {
+    if (!/^[a-f0-9]{64}$/.test(captchaTokenHash)) {
+      throw new ApiError(400, "CAPTCHA verification failed");
+    }
     const displayName = input.display_name.normalize("NFKC").trim();
     const nameKey = normalizeName(displayName);
     const body = input.body.normalize("NFKC").trim();
@@ -147,6 +153,19 @@ export function createPostsService(
 
     try {
       return await transaction(client, async () => {
+        const claimedCaptcha = await client.query(
+          `
+            INSERT INTO used_captcha_tokens (token_hash)
+            VALUES ($1)
+            ON CONFLICT (token_hash) DO NOTHING
+            RETURNING token_hash
+          `,
+          [captchaTokenHash],
+        );
+        if (claimedCaptcha.rowCount !== 1) {
+          throw new ApiError(400, "CAPTCHA verification failed");
+        }
+
         const duplicate = await client.query(
           "SELECT 1 FROM posts WHERE name_key = $1",
           [nameKey],
@@ -186,6 +205,13 @@ export function createPostsService(
         const row = inserted.rows[0];
         if (!row) {
           throw new Error("Post insert returned no row");
+        }
+        const checkInEmail = input.check_in_email?.trim();
+        if (checkInEmail) {
+          await client.query(
+            "INSERT INTO check_ins (post_id, email) VALUES ($1, $2)",
+            [row.id, checkInEmail],
+          );
         }
         return createPostResponse(row, category, editKey);
       });
@@ -227,6 +253,38 @@ export function createPostsService(
       throw new ApiError(404, "Post not found");
     }
     return post;
+  }
+
+  async function getOwnerPost(
+    id: string,
+    editKey: string,
+  ): Promise<Omit<CreatedPost, "edit_key">> {
+    const result = await pool.query<StoredPost & { created_at: Date | string }>(
+      `
+        SELECT id, display_name, name_key, body, category, status,
+          edit_key_hash, semester_id, created_at
+        FROM posts
+        WHERE id = $1
+      `,
+      [id],
+    );
+    const post = result.rows[0];
+    if (!post || !hasValidEditKey(post.edit_key_hash, editKey)) {
+      throw new ApiError(404, "Post not found");
+    }
+    if (post.status === "rejected" || post.status === "removed") {
+      throw new ApiError(410, "This post was removed");
+    }
+    const createdAt = post.created_at instanceof Date
+      ? post.created_at.toISOString()
+      : new Date(post.created_at).toISOString();
+    return {
+      id: post.id,
+      display_name: post.display_name,
+      body: post.body,
+      category: post.category,
+      created_at: createdAt,
+    };
   }
 
   async function requireOpenSemester(client: PoolClient, semesterId: string): Promise<void> {
@@ -319,6 +377,7 @@ export function createPostsService(
           "UPDATE posts SET status = 'removed', rejected_at = NULL, updated_at = now() WHERE id = $1",
           [id],
         );
+        await client.query("DELETE FROM check_ins WHERE post_id = $1", [id]);
       });
     } finally {
       client.release();
@@ -469,11 +528,20 @@ export function createPostsService(
     return result.rowCount ?? 0;
   }
 
+  async function purgeExpiredCaptchaTokens(): Promise<number> {
+    const result = await pool.query(
+      "DELETE FROM used_captcha_tokens WHERE created_at < now() - interval '10 minutes'",
+    );
+    return result.rowCount ?? 0;
+  }
+
   return {
     checkPostRateLimit: (deviceId: string, ip: string) =>
       consumeRateLimit("post", deviceId, ip, config.postsPerHour, "hour"),
     purgeExpiredRateLimits,
+    purgeExpiredCaptchaTokens,
     createPost,
+    getOwnerPost,
     patchPost,
     deletePost,
     addLike,

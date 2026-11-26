@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import bcrypt from "bcryptjs";
@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import { createApp } from "./app.js";
 import type { AppConfig } from "./config.js";
 import { createAdminService } from "./admin/service.js";
+import { assertRuntimeRole } from "./db/permissions.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -16,14 +17,18 @@ test("public v1 endpoints use the PRD database rules", {
   const pool = new Pool({ connectionString: databaseUrl });
   const testPrefix = `v1-${randomUUID()}`;
   const bannedTerm = `badword${randomUUID().replaceAll("-", "")}`;
+  const replayableCaptchaToken = randomUUID();
   let semesterId: string | undefined;
   let createdSemester = false;
+  const createdSemesterIds: string[] = [];
   const createdNames: string[] = [];
   const createdModeratorIds: string[] = [];
+  const usedCaptchaTokenHashes = new Set<string>();
   await pool.query("DELETE FROM post_rate_limits");
   const testConfig: AppConfig = {
     nodeEnv: "test",
     port: 3001,
+    databaseUrl: databaseUrl ?? "postgresql://test:test@localhost/test",
     corsOrigins: [],
     trustedProxies: ["127.0.0.1"],
     ipHashSecret: "v1-integration-test-secret-0123456789",
@@ -48,24 +53,78 @@ test("public v1 endpoints use the PRD database rules", {
     body: string,
     deviceId: string,
     forwardedIp: string,
-    captchaToken = "test-token",
+    captchaToken: string = randomUUID(),
     category?: string,
-  ) => fetch(`${baseUrl}/posts`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Device-Id": deviceId,
-      "X-Forwarded-For": forwardedIp,
-    },
-    body: JSON.stringify({
-      display_name: displayName,
-      body,
-      category,
-      captcha_token: captchaToken,
-    }),
-  });
+    checkInEmail?: string,
+  ) => {
+    usedCaptchaTokenHashes.add(
+      createHash("sha256").update(captchaToken).digest("hex"),
+    );
+    return fetch(`${baseUrl}/posts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Device-Id": deviceId,
+        "X-Forwarded-For": forwardedIp,
+      },
+      body: JSON.stringify({
+        display_name: displayName,
+        body,
+        category,
+        check_in_email: checkInEmail,
+        captcha_token: captchaToken,
+      }),
+    });
+  };
 
   try {
+    const currentRole = await pool.query<{ is_superuser: boolean }>(
+      "SELECT rolsuper AS is_superuser FROM pg_roles WHERE rolname = current_user",
+    );
+    if (currentRole.rows[0]?.is_superuser) {
+      await assert.rejects(assertRuntimeRole(pool), /not least-privileged/);
+    }
+
+    const productionConfig: AppConfig = {
+      ...testConfig,
+      nodeEnv: "production",
+      corsOrigins: ["https://board.example.org"],
+    };
+    const productionProbe = createApp(pool, {
+      config: productionConfig,
+      verifyCaptcha: async () => true,
+    }).listen(0);
+    await new Promise<void>((resolve, reject) => {
+      productionProbe.once("listening", resolve);
+      productionProbe.once("error", reject);
+    });
+    try {
+      const probeAddress = productionProbe.address() as AddressInfo;
+      const insecureResponse = await fetch(`http://127.0.0.1:${probeAddress.port}/names/random`, {
+        headers: {
+          Origin: "https://board.example.org",
+          "X-Forwarded-Proto": "http",
+        },
+      });
+      assert.equal(insecureResponse.status, 426);
+    } finally {
+      await new Promise<void>((resolve) => productionProbe.close(() => resolve()));
+    }
+
+    const adminPreflight = await fetch(`${baseUrl}/admin/posts/example/approve`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: baseUrl,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-csrf-token",
+      },
+    });
+    assert.equal(adminPreflight.status, 204);
+    assert.match(
+      adminPreflight.headers.get("access-control-allow-headers") ?? "",
+      /x-csrf-token/i,
+    );
+
     await pool.query(
       "INSERT INTO banned_terms (term, type) VALUES ($1, 'test')",
       [bannedTerm],
@@ -85,6 +144,9 @@ test("public v1 endpoints use the PRD database rules", {
       );
       semesterId = inserted.rows[0]?.id;
       createdSemester = true;
+      if (semesterId) {
+        createdSemesterIds.push(semesterId);
+      }
     }
     assert.ok(semesterId);
 
@@ -114,8 +176,9 @@ test("public v1 endpoints use the PRD database rules", {
       "Complete the project before semester ends",
       "owner-device",
       "192.0.2.1",
-      "test-token",
+      replayableCaptchaToken,
       "academic",
+      `${testPrefix}@example.test`,
     );
     assert.equal(createdResponse.status, 201);
     const created = await createdResponse.json() as {
@@ -128,7 +191,39 @@ test("public v1 endpoints use the PRD database rules", {
     createdNames.push(displayName);
     assert.equal(created.display_name, displayName);
     assert.equal(created.category, "academic");
+    assert.equal("check_in_email" in created, false);
     assert.match(created.edit_key, /^[A-Za-z0-9_-]{43}$/);
+
+    const storedCheckIn = await pool.query<{
+      email: string;
+      consented_at: Date;
+      sent_at: Date | null;
+      unsubscribed_at: Date | null;
+    }>(
+      "SELECT email, consented_at, sent_at, unsubscribed_at FROM check_ins WHERE post_id = $1",
+      [created.id],
+    );
+    assert.equal(storedCheckIn.rows[0]?.email, `${testPrefix}@example.test`);
+    assert.ok(storedCheckIn.rows[0]?.consented_at instanceof Date);
+    assert.equal(storedCheckIn.rows[0]?.sent_at, null);
+    assert.equal(storedCheckIn.rows[0]?.unsubscribed_at, null);
+
+    const ownerPostResponse = await fetch(`${baseUrl}/posts/${created.id}/owner`, {
+      headers: { "X-Edit-Key": created.edit_key },
+    });
+    assert.equal(ownerPostResponse.status, 200);
+    const ownerPost = await ownerPostResponse.json() as Record<string, unknown>;
+    assert.equal(ownerPost.id, created.id);
+    assert.equal("status" in ownerPost, false);
+
+    const replayedCaptcha = await createRequest(
+      `${testPrefix}-replayed-captcha`,
+      "This token has already been used",
+      "replayed-captcha-device",
+      "192.0.2.6",
+      replayableCaptchaToken,
+    );
+    assert.equal(replayedCaptcha.status, 400);
 
     const duplicateResponse = await createRequest(
       displayName.toUpperCase(),
@@ -159,7 +254,20 @@ test("public v1 endpoints use the PRD database rules", {
       "192.0.2.2",
     );
     assert.equal(heldNameResponse.status, 201);
-    const heldNamePost = await heldNameResponse.json() as { id: string };
+    const heldNamePost = await heldNameResponse.json() as { id: string; edit_key: string };
+    const noCheckInEmail = await pool.query<{ count: number }>(
+      "SELECT count(*)::integer AS count FROM check_ins WHERE post_id = $1",
+      [heldNamePost.id],
+    );
+    assert.equal(noCheckInEmail.rows[0]?.count, 0);
+    const heldOwnerResponse = await fetch(`${baseUrl}/posts/${heldNamePost.id}/owner`, {
+      headers: { "X-Edit-Key": heldNamePost.edit_key },
+    });
+    assert.equal(heldOwnerResponse.status, 200);
+    assert.equal(
+      "status" in (await heldOwnerResponse.json() as Record<string, unknown>),
+      false,
+    );
 
     const obfuscatedBodyName = `${testPrefix}-obfuscated`;
     createdNames.push(obfuscatedBodyName);
@@ -203,6 +311,17 @@ test("public v1 endpoints use the PRD database rules", {
       "rejected",
     );
     assert.equal(captchaFailure.status, 400);
+
+    const invalidEmail = await createRequest(
+      `${testPrefix}-invalid-email`,
+      "A valid goal",
+      "invalid-email-device",
+      "203.0.113.201",
+      randomUUID(),
+      undefined,
+      "not-an-email",
+    );
+    assert.equal(invalidEmail.status, 400);
 
     const availabilityAfter = await fetch(
       `${baseUrl}/names/check?name=${encodeURIComponent(displayName.toUpperCase())}`,
@@ -317,9 +436,22 @@ test("public v1 endpoints use the PRD database rules", {
       headers: { "X-Edit-Key": created.edit_key },
     });
     assert.equal(deleteResponse.status, 204);
+    const deletedCheckIn = await pool.query<{ count: number }>(
+      "SELECT count(*)::integer AS count FROM check_ins WHERE post_id = $1",
+      [created.id],
+    );
+    assert.equal(deletedCheckIn.rows[0]?.count, 0);
+    const removedOwnerResponse = await fetch(`${baseUrl}/posts/${created.id}/owner`, {
+      headers: { "X-Edit-Key": created.edit_key },
+    });
+    assert.equal(removedOwnerResponse.status, 410);
 
     const interactionName = `${testPrefix}-interaction`;
     createdNames.push(interactionName);
+    const interactionCaptchaToken = randomUUID();
+    usedCaptchaTokenHashes.add(
+      createHash("sha256").update(interactionCaptchaToken).digest("hex"),
+    );
     const interactionResponse = await fetch(`${baseUrl}/posts`, {
       method: "POST",
       headers: {
@@ -329,7 +461,7 @@ test("public v1 endpoints use the PRD database rules", {
       body: JSON.stringify({
         display_name: interactionName,
         body: "A goal for interaction checks",
-        captcha_token: "test-token",
+        captcha_token: interactionCaptchaToken,
       }),
     });
     assert.equal(interactionResponse.status, 201);
@@ -349,6 +481,29 @@ test("public v1 endpoints use the PRD database rules", {
       },
       body: method === "POST" ? "{}" : undefined,
     });
+    const seedLikeRateLimit = async (
+      subjectType: "device" | "ip",
+      identifier: string,
+    ) => {
+      const subjectHash = createHmac("sha256", testConfig.ipHashSecret)
+        .update(`${subjectType}:${identifier}`)
+        .digest("hex");
+      await pool.query(
+        `
+          INSERT INTO post_rate_limits (
+            action_type, subject_type, subject_hash, window_started_at, request_count
+          )
+          VALUES (
+            'like', $1, $2,
+            date_trunc('minute', CURRENT_TIMESTAMP) + interval '10 minutes', 0
+          )
+          ON CONFLICT (action_type, subject_type, subject_hash) DO UPDATE SET
+            window_started_at = EXCLUDED.window_started_at,
+            request_count = 0
+        `,
+        [subjectType, subjectHash],
+      );
+    };
 
     const likePath = `/posts/${interactionPost.id}/like`;
     assert.deepEqual(await (await request(likePath, "POST", "device-a")).json(), {
@@ -364,6 +519,7 @@ test("public v1 endpoints use the PRD database rules", {
       like_count: 1,
     });
 
+    await seedLikeRateLimit("device", "like-limit-device");
     for (let attempt = 1; attempt <= 30; attempt += 1) {
       const response = await request(
         likePath,
@@ -381,6 +537,7 @@ test("public v1 endpoints use the PRD database rules", {
     );
     assert.equal(thirtyFirstDeviceLike.status, 429);
 
+    await seedLikeRateLimit("ip", "198.51.100.30");
     for (let attempt = 1; attempt <= 30; attempt += 1) {
       const response = await request(
         likePath,
@@ -390,6 +547,17 @@ test("public v1 endpoints use the PRD database rules", {
       );
       assert.equal(response.status, 200);
     }
+    const expectedIpHash = createHmac("sha256", testConfig.ipHashSecret)
+      .update("ip:198.51.100.30")
+      .digest("hex");
+    const ipLimitState = await pool.query<{ request_count: number }>(
+      `
+        SELECT request_count FROM post_rate_limits
+        WHERE action_type = 'like' AND subject_type = 'ip' AND subject_hash = $1
+      `,
+      [expectedIpHash],
+    );
+    assert.equal(ipLimitState.rows[0]?.request_count, 30);
     const thirtyFirstIpLike = await request(
       likePath,
       "POST",
@@ -495,6 +663,11 @@ test("public v1 endpoints use the PRD database rules", {
       {},
     );
     assert.equal(rejectResponse.status, 204);
+    const rejectedOwnerResponse = await fetch(
+      `${baseUrl}/posts/${heldNamePost.id}/owner`,
+      { headers: { "X-Edit-Key": heldNamePost.edit_key } },
+    );
+    assert.equal(rejectedOwnerResponse.status, 410);
     const undoRejectResponse = await adminRequest(
       `/admin/posts/${heldNamePost.id}/undo`,
       "POST",
@@ -615,13 +788,6 @@ test("public v1 endpoints use the PRD database rules", {
     );
     assert.equal(deactivated.rows[0]?.active, false);
 
-    const logoutResponse = await adminRequest("/admin/logout", "POST", undefined, {});
-    assert.equal(logoutResponse.status, 204);
-    const afterLogout = await fetch(`${baseUrl}/admin/queue`, {
-      headers: { Cookie: adminCookie },
-    });
-    assert.equal(afterLogout.status, 401);
-
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const name = `${testPrefix}-device-limit-${attempt}`;
       createdNames.push(name);
@@ -672,6 +838,78 @@ test("public v1 endpoints use the PRD database rules", {
     );
     assert.ok(storedDevices.rows.every((row) => /^[a-f0-9]{64}$/.test(row.device_id)));
     assert.ok(storedDevices.rows.every((row) => !row.device_id.startsWith("reporter-")));
+
+    const semestersResponse = await fetch(`${baseUrl}/admin/semesters`, {
+      headers: { Cookie: adminCookie },
+    });
+    assert.equal(semestersResponse.status, 200);
+    const semesters = await semestersResponse.json() as {
+      semesters: { id: string; state: string }[];
+    };
+    assert.ok(semesters.semesters.some((semester) => semester.id === semesterId));
+
+    if (createdSemester && semesterId) {
+      const alreadyOpen = await adminRequest("/admin/semesters", "POST", undefined, {
+        name: `${testPrefix} duplicate semester`,
+        ends_on: "2027-12-31",
+      });
+      assert.equal(alreadyOpen.status, 409);
+
+      const closeCurrent = await adminRequest(
+        `/admin/semesters/${semesterId}/close`,
+        "POST",
+        undefined,
+        {},
+      );
+      assert.equal(closeCurrent.status, 204);
+      const closedState = await pool.query<{ state: string }>(
+        "SELECT state FROM semesters WHERE id = $1",
+        [semesterId],
+      );
+      assert.equal(closedState.rows[0]?.state, "closed");
+
+      const nextSemesterResponse = await adminRequest(
+        "/admin/semesters",
+        "POST",
+        undefined,
+        { name: `${testPrefix} next semester`, ends_on: "2027-12-31" },
+      );
+      assert.equal(nextSemesterResponse.status, 201);
+      const nextSemester = await nextSemesterResponse.json() as {
+        semester: { id: string; state: string };
+      };
+      assert.equal(nextSemester.semester.state, "open");
+      createdSemesterIds.push(nextSemester.semester.id);
+
+      const closeNext = await adminRequest(
+        `/admin/semesters/${nextSemester.semester.id}/close`,
+        "POST",
+        undefined,
+        {},
+      );
+      assert.equal(closeNext.status, 204);
+
+      const postAfterClosure = await createRequest(
+        `${testPrefix}-post-after-close`,
+        "This must not be accepted after the semester closes",
+        "closed-semester-device",
+        "192.0.2.80",
+      );
+      assert.equal(postAfterClosure.status, 409);
+    } else {
+      const secondOpen = await adminRequest("/admin/semesters", "POST", undefined, {
+        name: `${testPrefix} conflicting semester`,
+        ends_on: "2027-12-31",
+      });
+      assert.equal(secondOpen.status, 409);
+    }
+
+    const logoutResponse = await adminRequest("/admin/logout", "POST", undefined, {});
+    assert.equal(logoutResponse.status, 204);
+    const afterLogout = await fetch(`${baseUrl}/admin/queue`, {
+      headers: { Cookie: adminCookie },
+    });
+    assert.equal(afterLogout.status, 401);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (createdNames.length) {
@@ -679,8 +917,10 @@ test("public v1 endpoints use the PRD database rules", {
         createdNames.map((name) => name.toLowerCase()),
       ]);
     }
-    if (createdSemester && semesterId) {
-      await pool.query("DELETE FROM semesters WHERE id = $1", [semesterId]);
+    if (createdSemesterIds.length) {
+      await pool.query("DELETE FROM semesters WHERE id = ANY($1::uuid[])", [
+        createdSemesterIds,
+      ]);
     }
     if (createdModeratorIds.length) {
       await pool.query("DELETE FROM moderators WHERE id = ANY($1::uuid[])", [createdModeratorIds]);
@@ -688,6 +928,11 @@ test("public v1 endpoints use the PRD database rules", {
     await pool.query("DELETE FROM banned_terms WHERE type = 'test'");
     await pool.query("DELETE FROM banned_terms WHERE type = 'test' AND term = $1", [bannedTerm]);
     await pool.query("DELETE FROM post_rate_limits");
+    if (usedCaptchaTokenHashes.size) {
+      await pool.query("DELETE FROM used_captcha_tokens WHERE token_hash = ANY($1::text[])", [
+        [...usedCaptchaTokenHashes],
+      ]);
+    }
     await pool.end();
   }
 });

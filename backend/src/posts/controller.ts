@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { ApiError } from "../errors.js";
@@ -9,6 +10,7 @@ const postBodySchema = z.object({
   display_name: z.string().trim().min(1),
   body: z.string().trim().min(1).max(300),
   category: z.enum(postCategories).nullable().optional(),
+  check_in_email: z.string().trim().email().max(320).optional(),
   captcha_token: z.string().min(1).max(2048),
 }).strict();
 
@@ -65,6 +67,15 @@ export function postsRouter(
     res.json(await feed.listPosts(parsed.data));
   });
 
+  router.get("/:id/owner", async (req, res) => {
+    const id = postId(req.params);
+    const editKey = z.string().regex(/^[A-Za-z0-9_-]{43}$/).safeParse(req.get("X-Edit-Key"));
+    if (!editKey.success) {
+      throw new ApiError(400, "Invalid owner-post request");
+    }
+    res.json(await service.getOwnerPost(id, editKey.data));
+  });
+
   router.post("/", async (req, res) => {
     const parsed = postBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -78,8 +89,19 @@ export function postsRouter(
     if (!(await options.verifyCaptcha(parsed.data.captcha_token))) {
       throw new ApiError(400, "CAPTCHA verification failed");
     }
-    const { captcha_token: _captchaToken, ...input } = parsed.data;
-    res.status(201).json(await service.createPost(input));
+    const {
+      captcha_token: _captchaToken,
+      check_in_email: _unusedEmail,
+      ...postFields
+    } = parsed.data;
+    const input = {
+      ...postFields,
+      check_in_email: parsed.data.check_in_email,
+    };
+    const captchaTokenHash = createHash("sha256")
+      .update(parsed.data.captcha_token)
+      .digest("hex");
+    res.status(201).json(await service.createPost(input, captchaTokenHash));
   });
 
   router.patch("/:id", async (req, res) => {

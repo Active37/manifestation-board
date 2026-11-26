@@ -9,7 +9,7 @@
     "db:migrate": "node --env-file=.env --import tsx backend/src/db/migrate.ts",
     "db:verify": "node --env-file=.env --import tsx backend/src/db/verify-schema.ts",
     "admin:bootstrap": "node --env-file=.env --import tsx backend/src/admin/bootstrap.ts",
-    "test:api": "node --import tsx --test backend/src/app.test.ts"
+    "test:api": "node --import tsx --test backend/src/config.test.ts backend/src/posts/captcha.test.ts backend/src/app.test.ts"
   },
   "engines": {
     "node": ">=20.6"

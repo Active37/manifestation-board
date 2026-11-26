@@ -18,6 +18,11 @@ const moderatorSchema = z.object({
 }).strict();
 const moderatorParamsSchema = z.object({ id: z.string().uuid() }).strict();
 const postParamsSchema = z.object({ id: z.string().uuid() }).strict();
+const semesterParamsSchema = z.object({ id: z.string().uuid() }).strict();
+const createSemesterSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  ends_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+}).strict();
 const bannedTermSchema = z.object({
   term: z.string().trim().min(1),
   type: z.string().trim().min(1),
@@ -58,6 +63,11 @@ function matchesCsrfHash(expectedHash: string, value: string | undefined): boole
     Buffer.from(expectedHash, "hex"),
     createHash("sha256").update(value).digest(),
   );
+}
+
+function isCalendarDate(value: string): boolean {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 export function adminRouter(api: AdminService, allowedOrigins: string[]): Router {
@@ -257,6 +267,52 @@ export function adminRouter(api: AdminService, allowedOrigins: string[]): Router
   moderationAction("/posts/:id/reject", api.rejectPost);
   moderationAction("/posts/:id/undo", api.undoModeration);
   moderationAction("/posts/:id/restore", api.restoreRejectedPost);
+
+  router.get("/semesters", requireSession, requireAdmin, async (req, res) => {
+    if (!emptyQuerySchema.safeParse(req.query).success) {
+      throw new ApiError(400, "Invalid semester query");
+    }
+    res.json({ semesters: await api.listSemesters() });
+  });
+
+  router.post(
+    "/semesters",
+    requireOrigin,
+    requireSession,
+    requireAdmin,
+    requireCsrf,
+    async (req, res) => {
+      const parsed = createSemesterSchema.safeParse(req.body);
+      if (!parsed.success || !isCalendarDate(parsed.data?.ends_on ?? "")) {
+        throw new ApiError(400, "Invalid semester request");
+      }
+      const semester = await api.createSemester(
+        parsed.data.name,
+        parsed.data.ends_on,
+      );
+      res.status(201).json({ semester });
+    },
+  );
+
+  router.post(
+    "/semesters/:id/close",
+    requireOrigin,
+    requireSession,
+    requireAdmin,
+    requireCsrf,
+    async (req, res) => {
+      const params = semesterParamsSchema.safeParse(req.params);
+      if (
+        !params.success ||
+        !emptyQuerySchema.safeParse(req.query).success ||
+        !emptyBodySchema.safeParse(req.body ?? {}).success
+      ) {
+        throw new ApiError(400, "Invalid semester request");
+      }
+      await api.closeSemester(params.data.id);
+      res.status(204).end();
+    },
+  );
 
   return router;
 }
